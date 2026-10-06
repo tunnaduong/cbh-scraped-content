@@ -1,0 +1,18 @@
+{
+    "name": "cbh/scraped-content",
+    "description": "Scrape bài viết công khai của trang Facebook Đoàn trường THPT chuyên Biên Hòa ra JSON + media",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "CbhScraper\\": "src/"
+        }
+    },
+    "scripts": {
+        "scrape": "@php scrape.php"
+    }
+}
