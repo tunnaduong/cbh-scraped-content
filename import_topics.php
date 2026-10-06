@@ -5,7 +5,7 @@
  * storage của API, tạo dòng cyo_cdn_user_content và cyo_topics tương ứng.
  *
  * Chạy ngay trên máy chủ chứa API, dùng cấu hình DB sẵn có của Laravel:
- *   php import_topics.php <thư mục API> [--data=./data] [--username=DoanTruongCBH] [--subforum=32] [--dry-run] [--prune-media]
+ *   php import_topics.php <thư mục API> [--data=./data] [--username=DoanTruongCBH] [--subforum=32] [--dry-run] [--prune-media] [--repair]
  *
  * Chạy lại an toàn: bài đã nạp được ghi trong <data>/imported.json và bị bỏ qua.
  */
@@ -45,7 +45,9 @@ if (!$userId || !DB::table('cyo_forum_subforums')->where('id', $subforumId)->exi
     exit(1);
 }
 $hasModeration = Schema::hasColumn('cyo_topics', 'moderation_status');
-$imageIdLimit = 255; // cdn_image_id là varchar(255)
+// Bản cũ của bảng dùng varchar(255) cho cdn_image_id, chỉ chứa được khoảng 50 id ảnh
+$imageIdType = DB::select("SHOW COLUMNS FROM cyo_topics WHERE Field = 'cdn_image_id'")[0]->Type;
+$imageIdLimit = str_starts_with($imageIdType, 'varchar') ? 255 : PHP_INT_MAX;
 
 $mapFile = "{$dataDir}/imported.json";
 $imported = is_file($mapFile) ? json_decode(file_get_contents($mapFile), true) : [];
@@ -64,6 +66,64 @@ foreach (glob("{$dataDir}/posts/*/post.json") as $file) {
 usort($posts, fn ($a, $b) => $a['creation_time'] <=> $b['creation_time']);
 
 $disk = Storage::disk('public');
+
+// --repair: bổ sung ảnh còn thiếu cho các bài đã nạp (ảnh bị bỏ vì giới hạn cột cũ hoặc tải lỗi)
+if (isset($options['repair'])) {
+    $repaired = 0;
+    foreach ($posts as $post) {
+        $topicId = $imported[$post['post_id']] ?? null;
+        $photos = array_values(array_filter($post['media'], fn ($m) => $m['type'] === 'photo'));
+        if (!$topicId || !$photos) {
+            continue;
+        }
+
+        $have = [];
+        foreach (DB::table('cyo_cdn_user_content')->where('user_id', $userId)->where('file_name', 'like', "{$post['creation_time']}\_fb%")->get(['id', 'file_name']) as $row) {
+            $have[preg_replace('/^\d+_fb(\d+)\..*$/', '$1', $row->file_name)] = $row->id;
+        }
+        $missing = array_filter($photos, fn ($m) => !isset($have[$m['id']]));
+        if (!$missing) {
+            continue;
+        }
+        echo "* {$post['post_id']} (topic {$topicId}) thiếu " . count($missing) . '/' . count($photos) . " ảnh\n";
+        if ($dryRun) {
+            continue;
+        }
+
+        $createdAt = date('Y-m-d H:i:s', $post['creation_time']);
+        foreach ($missing as $media) {
+            $local = $media['file'] ? "{$dataDir}/posts/{$post['post_id']}/{$media['file']}" : null;
+            $extension = strtolower(pathinfo(parse_url($media['source_url'] ?? '', PHP_URL_PATH) ?: (string) $local, PATHINFO_EXTENSION)) ?: 'jpg';
+            $fileName = "{$post['creation_time']}_fb{$media['id']}.{$extension}";
+            $target = $disk->path("images/{$fileName}");
+
+            if ($local && is_file($local)) {
+                copy($local, $target);
+            } elseif (!$media['source_url'] || !@copy($media['source_url'], $target) || filesize($target) < 1000) {
+                // Link CDN của Facebook hết hạn sau vài ngày; khi đó phải scrape lại bài này
+                @unlink($target);
+                echo "  ! Không lấy lại được ảnh {$media['id']}\n";
+                continue;
+            }
+            $have[$media['id']] = DB::table('cyo_cdn_user_content')->insertGetId([
+                'user_id' => $userId,
+                'file_name' => $fileName,
+                'file_path' => "images/{$fileName}",
+                'file_type' => mime_content_type($target) ?: 'image/jpeg',
+                'file_size' => filesize($target),
+                'created_at' => $createdAt,
+                'updated_at' => $createdAt,
+            ]);
+        }
+
+        // Giữ đúng thứ tự ảnh của bài gốc; không đụng updated_at để bài không bị gắn nhãn "Đã sửa"
+        $ids = array_values(array_filter(array_map(fn ($m) => $have[$m['id']] ?? null, $photos)));
+        DB::table('cyo_topics')->where('id', $topicId)->update(['cdn_image_id' => implode(',', $ids)]);
+        $repaired++;
+    }
+    echo ($dryRun ? 'Chạy thử: ' : '') . "Đã bổ sung ảnh cho {$repaired} bài.\n";
+    exit(0);
+}
 // Một số bài đã được đăng tay lên diễn đàn trước đó (khác giờ đăng), nhận diện theo tiêu đề
 $normalize = fn (string $title) => mb_strtolower(preg_replace('/[^\p{L}\p{N}]+/u', '', $title));
 $existingTitles = array_flip(DB::table('cyo_topics')->where('user_id', $userId)->whereNull('deleted_at')->pluck('title')->map($normalize)->all());
