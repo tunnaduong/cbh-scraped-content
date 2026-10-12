@@ -105,3 +105,13 @@ bash /www/cbh-scraped-content/sync.sh
 ```
 
 Đặt `NTFY_URL=https://…/<topic>` trước lệnh để nhận thông báo khi lỗi. Bài bị sửa hoặc xoá trên Facebook sau khi đã nạp sẽ không được cập nhật theo.
+
+## Khôi phục media bị mất
+
+Nếu file ảnh/video của các bài đã nạp bị xoá khỏi storage của API (dòng DB vẫn còn), `--repair` hỏi Facebook link mới cho từng file và tải lại đúng tên cũ; nó cũng bổ sung ảnh chưa từng được nạp. Thêm `--dry-run` để chỉ liệt kê.
+
+```bash
+sudo -u www php import_topics.php /www/wwwroot/api.chuyenbienhoa.com --repair
+```
+
+Chỉ khôi phục được khi bài gốc còn trên Facebook.

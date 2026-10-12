@@ -12,6 +12,7 @@
 
 use App\Models\Topic;
 use App\Services\HashtagService;
+use CbhScraper\FacebookClient;
 use Illuminate\Contracts\Console\Kernel;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -35,6 +36,12 @@ $dataDir = rtrim($options['data'] ?? __DIR__ . '/data', '/');
 $dryRun = isset($options['dry-run']);
 
 require "{$appDir}/vendor/autoload.php";
+// Không nạp vendor/autoload.php của scraper: classmap của nó đè lên autoloader của Laravel
+spl_autoload_register(function (string $class) {
+    if (str_starts_with($class, 'CbhScraper\\')) {
+        require __DIR__ . '/src/' . substr($class, 11) . '.php';
+    }
+});
 $app = require "{$appDir}/bootstrap/app.php";
 $app->make(Kernel::class)->bootstrap();
 
@@ -67,19 +74,51 @@ usort($posts, fn ($a, $b) => $a['creation_time'] <=> $b['creation_time']);
 
 $disk = Storage::disk('public');
 
-// --repair: bổ sung ảnh còn thiếu cho các bài đã nạp (ảnh bị bỏ vì giới hạn cột cũ hoặc tải lỗi)
+// --repair: với các bài đã nạp, tải lại file media đã bị xoá khỏi storage và bổ sung ảnh chưa từng được nạp
 if (isset($options['repair'])) {
     $repaired = 0;
+    $restored = 0;
+    $facebook = new FacebookClient(require __DIR__ . '/config.php');
     foreach ($posts as $post) {
         $topicId = $imported[$post['post_id']] ?? null;
         $photos = array_values(array_filter($post['media'], fn ($m) => $m['type'] === 'photo'));
-        if (!$topicId || !$photos) {
+        if (!$topicId || !$post['media']) {
             continue;
         }
 
         $have = [];
-        foreach (DB::table('cyo_cdn_user_content')->where('user_id', $userId)->where('file_name', 'like', "{$post['creation_time']}\_fb%")->get(['id', 'file_name']) as $row) {
-            $have[preg_replace('/^\d+_fb(\d+)\..*$/', '$1', $row->file_name)] = $row->id;
+        $lost = [];
+        foreach (DB::table('cyo_cdn_user_content')->where('user_id', $userId)->where('file_name', 'like', "{$post['creation_time']}\_fb%")->get(['id', 'file_name', 'file_path']) as $row) {
+            $mediaId = preg_replace('/^\d+_fb(\d+)\..*$/', '$1', $row->file_name);
+            $have[$mediaId] = $row->id;
+            if (!$disk->exists($row->file_path)) {
+                $lost[$mediaId] = $row;
+            }
+        }
+
+        // File đã bị xoá khỏi storage nhưng dòng DB còn: tải lại đúng tên cũ. Link CDN lưu lúc
+        // scrape đã hết hạn nên phải hỏi Facebook link mới cho từng media.
+        if ($lost) {
+            echo "* {$post['post_id']} (topic {$topicId}) mất " . count($lost) . " file\n";
+        }
+        foreach ($dryRun ? [] : $post['media'] as $media) {
+            if (!($row = $lost[$media['id']] ?? null)) {
+                continue;
+            }
+            try {
+                $url = $media['type'] === 'video'
+                    ? $facebook->videoSource($media['id'])
+                    : $facebook->photoPage($media['id'], $post['post_id'])['uri'];
+                if (!$url) {
+                    throw new RuntimeException('không tìm thấy link tải');
+                }
+                $disk->makeDirectory(dirname($row->file_path));
+                $facebook->download($url, $disk->path($row->file_path));
+                DB::table('cyo_cdn_user_content')->where('id', $row->id)->update(['file_size' => filesize($disk->path($row->file_path))]);
+                $restored++;
+            } catch (RuntimeException $e) {
+                echo "  ! {$media['type']} {$media['id']}: {$e->getMessage()}\n";
+            }
         }
         $missing = array_filter($photos, fn ($m) => !isset($have[$m['id']]));
         if (!$missing) {
@@ -121,7 +160,7 @@ if (isset($options['repair'])) {
         DB::table('cyo_topics')->where('id', $topicId)->update(['cdn_image_id' => implode(',', $ids)]);
         $repaired++;
     }
-    echo ($dryRun ? 'Chạy thử: ' : '') . "Đã bổ sung ảnh cho {$repaired} bài.\n";
+    echo ($dryRun ? 'Chạy thử: ' : '') . "Đã bổ sung ảnh cho {$repaired} bài, tải lại {$restored} file bị mất.\n";
     exit(0);
 }
 // Một số bài đã được đăng tay lên diễn đàn trước đó (khác giờ đăng), nhận diện theo tiêu đề
